@@ -1,6 +1,7 @@
 package age
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"filippo.io/age"
 	"filippo.io/age/armor"
+	"filippo.io/age/plugin"
 	"github.com/sirupsen/logrus"
 
 	"github.com/getsops/sops/v3/logging"
@@ -60,7 +62,7 @@ type MasterKey struct {
 	parsedIdentities []age.Identity
 	// parsedRecipient contains a parsed age public key.
 	// It is used to lazy-load the Recipient at-most once.
-	parsedRecipient *age.X25519Recipient
+	parsedRecipient age.Recipient
 }
 
 // MasterKeysFromRecipients takes a comma-separated list of Bech32-encoded
@@ -247,7 +249,7 @@ func getUserConfigDir() (string, error) {
 // SopsAgeKeyUserConfigPath). It will load all found references, and expects
 // at least one configuration to be present.
 func (key *MasterKey) loadIdentities() (ParsedIdentities, error) {
-	var readers = make(map[string]io.Reader, 0)
+	readers := make(map[string]io.Reader, 0)
 
 	if ageKey, ok := os.LookupEnv(SopsAgeKeyEnv); ok {
 		readers[SopsAgeKeyEnv] = strings.NewReader(ageKey)
@@ -284,7 +286,7 @@ func (key *MasterKey) loadIdentities() (ParsedIdentities, error) {
 
 	var identities ParsedIdentities
 	for n, r := range readers {
-		ids, err := age.ParseIdentities(r)
+		ids, err := parseIdentitiesR(r)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse '%s' age identities: %w", n, err)
 		}
@@ -293,10 +295,46 @@ func (key *MasterKey) loadIdentities() (ParsedIdentities, error) {
 	return identities, nil
 }
 
+func parseIdentitiesR(f io.Reader) ([]age.Identity, error) {
+	const privateKeySizeLimit = 1 << 24 // 16 MiB
+	var ids []age.Identity
+	scanner := bufio.NewScanner(io.LimitReader(f, privateKeySizeLimit))
+	var n int
+	for scanner.Scan() {
+		n++
+		line := scanner.Text()
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+
+		id, err := parseIdentities(line)
+		i := id[0]
+		if err != nil {
+			return nil, fmt.Errorf("error at line %d: %v", n, err)
+		}
+		ids = append(ids, i)
+
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read secret keys file: %v", err)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no secret keys found")
+	}
+	return ids, nil
+}
+
 // parseRecipient attempts to parse a string containing an encoded age public
 // key.
-func parseRecipient(recipient string) (*age.X25519Recipient, error) {
-	parsedRecipient, err := age.ParseX25519Recipient(recipient)
+func parseRecipient(recipient string) (age.Recipient, error) {
+	var parsedRecipient age.Recipient
+	var err error
+	switch {
+	case strings.HasPrefix(recipient, "age1") && strings.Count(recipient, "1") > 1:
+		parsedRecipient, err = plugin.NewRecipient(recipient, termUI)
+	case strings.HasPrefix(recipient, "age1"):
+		parsedRecipient, err = age.ParseX25519Recipient(recipient)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse input as Bech32-encoded age public key: %w", err)
 	}
@@ -309,11 +347,18 @@ func parseRecipient(recipient string) (*age.X25519Recipient, error) {
 func parseIdentities(identity ...string) (ParsedIdentities, error) {
 	var identities []age.Identity
 	for _, i := range identity {
-		parsed, err := age.ParseIdentities(strings.NewReader(i))
+		var parsed age.Identity
+		var err error
+		switch {
+		case strings.HasPrefix(i, "AGE-PLUGIN-"):
+			parsed, err = plugin.NewIdentity(i, termUI)
+		case strings.HasPrefix(i, "AGE-SECRET-KEY-1"):
+			parsed, err = age.ParseX25519Identity(i)
+		}
 		if err != nil {
 			return nil, err
 		}
-		identities = append(identities, parsed...)
+		identities = append(identities, parsed)
 	}
 	return identities, nil
 }
